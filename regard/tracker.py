@@ -9,6 +9,7 @@ from typing import Optional
 
 import numpy as np
 
+from .adapt import ClickCorrector
 from .face import FaceFrame, FaceSource
 from .gestures import ActionRunner, GestureDetector, load_config
 from .model import GazeModel, OneEuroFilter
@@ -19,7 +20,8 @@ from .windows import WindowInfo, make_locator
 class GazeTracker:
     """Appelé par FaceSource pour chaque image (dans le fil de la webcam)."""
 
-    def __init__(self, model: GazeModel, screen, use_actions=False, record=True):
+    def __init__(self, model: GazeModel, screen, use_actions=False, record=True,
+                 autocorrect=True):
         self.model = model
         self.w, self.h = screen
         self.filter = OneEuroFilter()
@@ -29,6 +31,14 @@ class GazeTracker:
         self.detector = GestureDetector(gestures)
         self.actions = ActionRunner(actions, options)
         self.actions.enabled = use_actions
+        self.corrector: Optional[ClickCorrector] = None
+        if autocorrect:
+            self.corrector = ClickCorrector(
+                model, screen, on_model=self._set_model,
+                # Clics inutilisables : ceux générés par Regard, ou quand le curseur suit le regard
+                is_suppressed=lambda: (self.actions.follow
+                                       or time.monotonic() - self.actions.last_synthetic < 0.5))
+            self.corrector.start_listener()
         self.paused = False
         self.lock = threading.Lock()
         self.gaze: Optional[np.ndarray] = None
@@ -38,6 +48,10 @@ class GazeTracker:
         self.last_t: Optional[float] = None
         self.last_events: list[tuple[float, str]] = []
         self._last_lookup = 0.0
+
+    def _set_model(self, model: GazeModel):
+        self.model = model
+        print(f"[regard] modèle ré-appris avec les clics (validation croisée : {model.cv_error:.0f} px)")
 
     def on_frame(self, face: Optional[FaceFrame], t: float):
         if self.locator is None:
@@ -67,6 +81,9 @@ class GazeTracker:
         # Pendant un clignement l'iris n'est pas visible : on garde la dernière position.
         if face.blink < 0.45 or self.gaze is None:
             raw = self.model.predict(face.features)
+            if self.corrector is not None:
+                self.corrector.add_frame(t, face.features)
+                raw = self.corrector.correct(raw)
             gaze = self.filter(raw, t)
         else:
             gaze = self.gaze
@@ -96,6 +113,8 @@ class GazeTracker:
                 self.recorder.add(dt, cx, cy, app)
 
     def close(self):
+        if self.corrector is not None:
+            self.corrector.stop()
         if self.recorder:
             self.recorder.close()
 
@@ -172,7 +191,11 @@ class StatusWindow:
         tk.Label(self.root, textvariable=self.title_var, font=("Segoe UI", 9), fg="#666",
                  width=48, anchor="w").grid(row=2, column=0, columnspan=3, **pad)
         tk.Label(self.root, textvariable=self.state_var, font=("Segoe UI", 9),
-                 anchor="w").grid(row=3, column=0, columnspan=3, **pad)
+                 anchor="w", justify="left").grid(row=3, column=0, columnspan=3, **pad)
+        self.follow_var = tk.StringVar(value="")
+        self.follow_lbl = tk.Label(self.root, textvariable=self.follow_var,
+                                   font=("Segoe UI", 9, "bold"), anchor="w")
+        self.follow_lbl.grid(row=7, column=0, columnspan=3, padx=10, pady=(4, 0), sticky="w")
         self.dot_var = tk.BooleanVar(value=show_dot)
         self.act_var = tk.BooleanVar(value=tracker.actions.enabled)
         tk.Checkbutton(self.root, text="Afficher le point du regard", variable=self.dot_var
@@ -183,9 +206,9 @@ class StatusWindow:
         tk.Label(self.root, textvariable=self.events_var, font=("Segoe UI", 9), fg="#666",
                  justify="left", anchor="w").grid(row=6, column=0, columnspan=3, **pad)
         self.pause_btn = tk.Button(self.root, text="Pause", width=10, command=self._toggle_pause)
-        self.pause_btn.grid(row=7, column=0, padx=10, pady=8, sticky="w")
+        self.pause_btn.grid(row=8, column=0, padx=10, pady=8, sticky="w")
         tk.Button(self.root, text="Quitter", width=10, command=self.quit
-                  ).grid(row=7, column=2, padx=10, pady=8, sticky="e")
+                  ).grid(row=8, column=2, padx=10, pady=8, sticky="e")
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
         self.root.geometry(f"+{sw - self.root.winfo_width() - 30}+40")
@@ -210,8 +233,11 @@ class StatusWindow:
         self.app_var.set("(en pause)" if tr.paused else app)
         self.title_var.set((win.title[:70] if win and app not in ("—",) else "") if not tr.paused else "")
         face = "visage ✓" if tr.face_ok else "visage ✗"
-        follow = " · curseur suit le regard" if tr.actions.follow else ""
-        self.state_var.set(f"{self.source.fps:4.1f} img/s · {face}{follow}")
+        self.state_var.set(f"{self.source.fps:4.1f} img/s · {face}"
+                           + (f"\n{tr.corrector.summary()}" if tr.corrector else ""))
+        self.follow_var.set("► CURSEUR PILOTÉ PAR LE REGARD (3 clignements pour arrêter)"
+                            if tr.actions.follow else "3 clignements rapides : le regard pilote le curseur")
+        self.follow_lbl.config(fg="#d9483b" if tr.actions.follow else "#666")
         recent = [lbl for ts, lbl in tr.last_events if time.time() - ts < 8]
         self.events_var.set("\n".join(recent[-3:]))
         show = self.dot_var.get() and gaze is not None and not tr.paused

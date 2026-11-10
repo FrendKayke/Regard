@@ -84,7 +84,7 @@ def _start_source(args):
 def _calibrate(source, args):
     from regard.calibration import calibrate
     rows, cols = args.grid
-    model = calibrate(source, rows, cols)
+    model = calibrate(source, rows, cols, head=not args.no_head)
     if model is None:
         print("Calibration annulée.")
     else:
@@ -122,7 +122,8 @@ def cmd_track(args):
         if model is None:
             source.stop()
             return
-    tracker = GazeTracker(model, model.screen, use_actions=args.actions, record=not args.no_record)
+    tracker = GazeTracker(model, model.screen, use_actions=args.actions,
+                          record=not args.no_record, autocorrect=not args.no_autocorrect)
     source.on_frame = tracker.on_frame
     print("Suivi en cours. Fermez la petite fenêtre « Regard » pour arrêter.")
     try:
@@ -165,10 +166,14 @@ def main():
                    ).set_defaults(fn=cmd_preview)
     c = sub.add_parser("calibrate", parents=[cam], help="calibrer le regard")
     c.add_argument("--grid", type=_pair("x"), default=(3, 5), help="lignes x colonnes (défaut 3x5)")
+    c.add_argument("--no-head", action="store_true", help="sans la phase « tête mobile »")
     c.set_defaults(fn=cmd_calibrate)
     t = sub.add_parser("track", parents=[cam], help="suivre le regard en direct")
     t.add_argument("--grid", type=_pair("x"), default=(3, 5), help=argparse.SUPPRESS)
+    t.add_argument("--no-head", action="store_true", help=argparse.SUPPRESS)
     t.add_argument("--recalibrate", action="store_true", help="refaire la calibration avant")
+    t.add_argument("--no-autocorrect", action="store_true",
+                   help="ne pas corriger le regard à partir des clics")
     t.add_argument("--no-dot", action="store_true", help="ne pas afficher le point du regard")
     t.add_argument("--no-record", action="store_true", help="ne rien enregistrer")
     t.add_argument("--actions", action="store_true", help="activer les actions par gestes du visage")

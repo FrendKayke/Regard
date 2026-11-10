@@ -14,9 +14,13 @@ from .face import FEATURE_NAMES
 # Écart-type minimal par caractéristique (unités brutes). Pendant la calibration la tête
 # bouge peu : sans ce plancher, un petit mouvement ultérieur ferait exploser la prédiction.
 STD_FLOOR = np.array([0.004, 0.004, 0.01, 3.0, 3.0, 3.0, 1.5, 1.5, 1.5])
-# Pénalité relative par terme du modèle (voir expand) : la pose de la tête varie peu pendant
-# la calibration, on la régularise beaucoup plus pour ne pas apprendre du bruit.
-PENALTY = np.array([0.0, 1, 1, 1, 20, 20, 20, 20, 20, 20, 1, 1, 1])
+# Pénalité relative par terme du modèle (voir expand). Si la tête a peu bougé pendant la
+# calibration, on régularise beaucoup plus ses termes pour ne pas apprendre du bruit ;
+# si elle a bougé (phase « tête mobile », clics), on les laisse apprendre normalement.
+BASE_PENALTY = np.array([0.0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+HEAD_TERMS = slice(4, 10)          # yaw, pitch, roll, tx, ty, tz dans expand()
+HEAD_STILL_PENALTY = 20.0
+HEAD_MOVED_STD = np.array([4.0, 4.0, 4.0, 2.0, 2.0, 2.0])  # au-delà : la tête a « bougé »
 ALPHAS = [0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0]
 
 
@@ -27,8 +31,18 @@ def expand(z: np.ndarray) -> np.ndarray:
     return np.column_stack([np.ones(len(z)), z, ex * ex, ey * ey, ex * ey])
 
 
-def _ridge(a: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
-    reg = alpha * np.diag(PENALTY[: a.shape[1]])  # la constante n'est pas pénalisée
+def penalties(x: np.ndarray) -> np.ndarray:
+    pen = BASE_PENALTY.copy()
+    head_std = np.asarray(x, float)[:, 3:9].std(axis=0)
+    pen[HEAD_TERMS] = np.where(head_std >= HEAD_MOVED_STD, 1.0, HEAD_STILL_PENALTY)
+    return pen
+
+
+def _ridge(a, y, alpha, pen, w=None) -> np.ndarray:
+    if w is not None:                      # moindres carrés pondérés
+        sw = np.sqrt(w)[:, None]
+        a, y = a * sw, y * sw
+    reg = alpha * np.diag(pen[: a.shape[1]])  # la constante n'est pas pénalisée
     return np.linalg.solve(a.T @ a + reg, a.T @ y)
 
 
@@ -51,16 +65,24 @@ class GazeModel:
         self.cv_error = cv_error
         self.created = created or time.strftime("%Y-%m-%d %H:%M:%S")
         self.validation_error: Optional[float] = None
+        self.head_free = False
+        # Échantillons de calibration conservés pour les ré-apprentissages (clics).
+        self.samples: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
 
     # --- apprentissage -------------------------------------------------------------
     @classmethod
-    def fit(cls, x: np.ndarray, y: np.ndarray, groups: np.ndarray, screen) -> "GazeModel":
+    def fit(cls, x: np.ndarray, y: np.ndarray, groups: np.ndarray, screen,
+            weights: Optional[np.ndarray] = None, keep_samples=True) -> "GazeModel":
+        """`groups` : un identifiant par cible (point de calibration ou clic) ;
+        `weights` : poids de chaque échantillon (défaut 1)."""
         x, y, groups = np.asarray(x, float), np.asarray(y, float), np.asarray(groups)
+        w_all = None if weights is None else np.asarray(weights, float)
         if len(np.unique(groups)) < 5:
             raise ValueError("Pas assez de points de calibration exploitables (visage perdu ?).")
         mean = x.mean(axis=0)
         std = np.maximum(x.std(axis=0), STD_FLOOR)
         a = expand(np.clip((x - mean) / std, -6, 6))
+        pen = penalties(x)
 
         # Choix de la régularisation par validation croisée « un point laissé de côté ».
         best_alpha, best_err = ALPHAS[0], math.inf
@@ -68,14 +90,19 @@ class GazeModel:
             errs = []
             for g in np.unique(groups):
                 test = groups == g
-                w = _ridge(a[~test], y[~test], alpha)
-                pred = np.median(a[test] @ w, axis=0)
-                errs.append(np.linalg.norm(pred - y[test][0]))
+                w = _ridge(a[~test], y[~test], alpha, pen,
+                           None if w_all is None else w_all[~test])
+                pred = a[test] @ w
+                errs.append(float(np.median(np.linalg.norm(pred - y[test], axis=1))))
             err = float(np.mean(errs))
             if err < best_err:
                 best_alpha, best_err = alpha, err
-        weights = _ridge(a, y, best_alpha)
-        return cls(mean, std, weights, best_alpha, screen, cv_error=best_err)
+        coefs = _ridge(a, y, best_alpha, pen, w_all)
+        model = cls(mean, std, coefs, best_alpha, screen, cv_error=best_err)
+        model.head_free = bool(pen[4] == 1.0 or pen[5] == 1.0)   # lacet ou tangage appris
+        if keep_samples:
+            model.samples = (x, y, groups)
+        return model
 
     # --- prédiction ---------------------------------------------------------------
     def predict(self, features: np.ndarray) -> np.ndarray:
@@ -88,7 +115,11 @@ class GazeModel:
         return dict(version=1, features=FEATURE_NAMES, mean=self.mean.tolist(),
                     std=self.std.tolist(), weights=self.weights.tolist(), alpha=self.alpha,
                     screen=list(self.screen), cv_error=self.cv_error, created=self.created,
-                    validation_error=self.validation_error)
+                    validation_error=self.validation_error, head_free=self.head_free,
+                    samples=None if self.samples is None else dict(
+                        x=np.round(self.samples[0], 5).tolist(),
+                        y=np.round(self.samples[1], 1).tolist(),
+                        groups=np.asarray(self.samples[2]).tolist()))
 
     def save(self, path: Path):
         path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
@@ -99,6 +130,10 @@ class GazeModel:
         m = cls(d["mean"], d["std"], d["weights"], d["alpha"], d["screen"],
                 d.get("cv_error"), d.get("created"))
         m.validation_error = d.get("validation_error")
+        m.head_free = d.get("head_free", False)
+        if d.get("samples"):
+            s = d["samples"]
+            m.samples = (np.array(s["x"], float), np.array(s["y"], float), np.array(s["groups"]))
         return m
 
 

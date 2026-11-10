@@ -29,13 +29,20 @@ def grid_points(rows: int, cols: int, margin: float = 0.06) -> list[tuple[float,
 
 
 VALIDATION_POINTS = [(0.5, 0.5), (0.25, 0.3), (0.75, 0.3), (0.3, 0.75), (0.7, 0.72)]
+# Phase « tête mobile » : on fixe un point en bougeant la tête, pour apprendre à compenser
+# les mouvements de tête (sinon le modèle ne marche bien que dans la posture de calibration).
+HEAD_POINTS = [(0.5, 0.5), (0.18, 0.2), (0.82, 0.2), (0.82, 0.8), (0.18, 0.8)]
+HEAD_MOVES = [(-1, 0), (1, 0), (0, -1), (0, 1)]   # gauche, droite, haut, bas
+HEAD_GROUP_OFFSET = 100
 
 
 class CalibrationUI:
-    def __init__(self, source: FaceSource, rows=3, cols=5, settle=0.9, collect=1.0):
+    def __init__(self, source: FaceSource, rows=3, cols=5, settle=0.9, collect=1.0,
+                 head=True, head_collect=4.0):
         self.source = source
         self.points = grid_points(rows, cols)
         self.settle, self.collect = settle, collect
+        self.head, self.head_collect = head, head_collect
         self.result: Optional[GazeModel] = None
 
         self.root = tk.Tk()
@@ -72,10 +79,17 @@ class CalibrationUI:
         self._text(self.h * 0.42,
                    "Installez-vous comme d'habitude, la tête immobile.\n"
                    "Fixez chaque point rouge jusqu'à ce qu'il disparaisse.\n"
-                   f"{len(self.points)} points, environ {int(len(self.points) * (self.settle + self.collect))} secondes.",
+                   + ("Ensuite, 5 points à fixer en bougeant doucement la tête.\n" if self.head else "")
+                   + f"Environ {int(self._duration())} secondes.",
                    18)
         self._text(self.h * 0.62, "ESPACE pour commencer  ·  ÉCHAP pour annuler", 16, "#9aa0a6")
         self._update_face_status()
+
+    def _duration(self) -> float:
+        d = len(self.points) * (self.settle + self.collect) + len(VALIDATION_POINTS) * 2
+        if self.head:
+            d += len(HEAD_POINTS) * (self.settle + self.head_collect) + 3
+        return d
 
     def _update_face_status(self):
         if self._phase != "intro":
@@ -98,13 +112,40 @@ class CalibrationUI:
     # --- collecte -------------------------------------------------------------------
     def _start_calibration(self):
         self._phase = "calib"
-        self.samples_x, self.samples_y, self.groups = [], [], []
-        self._run_points(self.points, self._on_calibration_done)
+        self._grid_collected: dict[int, list] = {}
+        self._head_collected: dict[int, list] = {}
+        self._run_points(self.points, self._on_grid_done)
 
-    def _run_points(self, points, done):
+    def _on_grid_done(self):
+        self._grid_collected = self._collected
+        if not self.head:
+            self._on_calibration_done()
+            return
+        self._phase = "message"
+        self.canvas.delete("all")
+        self._text(self.h * 0.42, "Maintenant : gardez les yeux sur le point\n"
+                   "et bougez DOUCEMENT la tête dans le sens de la flèche", 24)
+        self._text(self.h * 0.56, "← gauche · droite →   ↑ haut · bas ↓", 20, "#9aa0a6")
+        self.root.after(3000, self._start_head_phase)
+
+    def _start_head_phase(self):
+        if self._phase != "message":
+            return
+        self.canvas.delete("all")
+        self._phase = "calib"
+        self._run_points(HEAD_POINTS, self._on_head_done, collect=self.head_collect, head=True)
+
+    def _on_head_done(self):
+        self._head_collected = self._collected
+        self._on_calibration_done()
+
+    def _run_points(self, points, done, settle=None, collect=None, head=False):
         self._queue = list(enumerate(points))
         self._collected: dict[int, list] = {}
         self._done_cb = done
+        self._cur_settle = self.settle if settle is None else settle
+        self._cur_collect = self.collect if collect is None else collect
+        self._cur_head = head
         self._next_point()
 
     def _next_point(self):
@@ -123,14 +164,23 @@ class CalibrationUI:
             return
         el = time.monotonic() - self._t0
         x, y = self._target
+        settle, collect = self._cur_settle, self._cur_collect
         self.canvas.delete("dot")
-        if el < self.settle:                       # le cercle se resserre : on attend la saccade
-            r = 8 + 28 * (1 - el / self.settle)
+        if el < settle:                            # le cercle se resserre : on attend la saccade
+            r = 8 + 28 * (1 - el / settle)
             self._dot(x, y, r, ACCENT, fill=False)
             self._dot(x, y, 5, ACCENT)
-        elif el < self.settle + self.collect:      # collecte des images
+        elif el < settle + collect:                # collecte des images
             self._dot(x, y, 7, ACCENT)
             self._dot(x, y, 2, "#ffffff")
+            if self._cur_head:                     # flèche indiquant le mouvement de tête
+                k = int((el - settle) / collect * len(HEAD_MOVES)) % len(HEAD_MOVES)
+                dx, dy = HEAD_MOVES[k]
+                ox = 80 if x < self.w * 0.7 else -80     # flèche à côté du point
+                cx = x + ox
+                self.canvas.create_line(cx - dx * 28, y - dy * 28, cx + dx * 28, y + dy * 28,
+                                        fill=FG, width=6, arrow=tk.LAST,
+                                        arrowshape=(18, 22, 9), tag="dot")
             fid, face, _ = self.source.latest()
             if fid != self._last_id:
                 self._last_id = fid
@@ -144,7 +194,7 @@ class CalibrationUI:
     # --- apprentissage ----------------------------------------------------------------
     def _on_calibration_done(self):
         xs, ys, gs = [], [], []
-        for i, feats in self._collected.items():
+        for i, feats in self._grid_collected.items():
             if len(feats) < 4:
                 continue
             f = np.array(feats)
@@ -153,6 +203,16 @@ class CalibrationUI:
             xs.append(f)
             ys.append(np.tile([px * self.w, py * self.h], (len(f), 1)))
             gs.append(np.full(len(f), i))
+        for i, feats in self._head_collected.items():
+            # Ici l'iris bouge dans l'œil pour compenser la tête : pas de filtre de dispersion,
+            # on sous-échantillonne pour que chaque point ait un poids comparable à la grille.
+            if len(feats) < 10:
+                continue
+            f = np.array(feats)[::2]
+            px, py = HEAD_POINTS[i]
+            xs.append(f)
+            ys.append(np.tile([px * self.w, py * self.h], (len(f), 1)))
+            gs.append(np.full(len(f), HEAD_GROUP_OFFSET + i))
         self.canvas.delete("all")
         try:
             self.model = GazeModel.fit(np.vstack(xs), np.vstack(ys), np.concatenate(gs),
@@ -189,6 +249,8 @@ class CalibrationUI:
             quality = ("excellente" if cm < 2 else "bonne" if cm < 3.5
                        else "moyenne" if cm < 5.5 else "faible — recommencez")
             msg = f"Erreur moyenne : {err:.0f} px (≈ {cm:.1f} cm) — précision {quality}"
+            if self.model.head_free:
+                msg += "\nCompensation des mouvements de tête : active"
         else:
             msg = "Validation impossible (visage perdu)"
         self._text(self.h * 0.08, msg, 22)
@@ -216,5 +278,5 @@ class CalibrationUI:
         return self.result
 
 
-def calibrate(source: FaceSource, rows=3, cols=5) -> Optional[GazeModel]:
-    return CalibrationUI(source, rows, cols).run()
+def calibrate(source: FaceSource, rows=3, cols=5, head=True) -> Optional[GazeModel]:
+    return CalibrationUI(source, rows, cols, head=head).run()
