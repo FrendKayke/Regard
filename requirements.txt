@@ -1,0 +1,7 @@
+mediapipe>=0.10.14
+opencv-python>=4.8
+numpy
+psutil
+pynput
+pyobjc-framework-Quartz; sys_platform == "darwin"
+python-xlib; sys_platform == "linux"
